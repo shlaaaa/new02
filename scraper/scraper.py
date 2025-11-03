@@ -190,8 +190,16 @@ async def _load_products(page: Page, min_items: int) -> List[Locator]:
     while True:
         attempt += 1
         cards = await _get_product_cards(page)
-        LOGGER.info("Attempt %d: located %d product candidates", attempt, len(cards))
+        LOGGER.info(
+            "Attempt %d: located %d product candidates (target=%d)",
+            attempt,
+            len(cards),
+            min_items,
+        )
         if len(cards) >= min_items:
+            LOGGER.info(
+                "Min item threshold reached on attempt %d; proceeding to extraction", attempt
+            )
             return cards
         if len(cards) == seen:
             attempts_without_growth += 1
@@ -214,7 +222,13 @@ async def _load_products(page: Page, min_items: int) -> List[Locator]:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
             LOGGER.debug("Failed to scroll via window.scrollTo")
-        await _click_load_more(page)
+        clicked = await _click_load_more(page)
+        if not clicked:
+            LOGGER.info(
+                "Attempt %d: no load more control clicked (attempts_without_growth=%d)",
+                attempt,
+                attempts_without_growth,
+            )
         try:
             await page.wait_for_load_state("networkidle")
         except Exception:
@@ -222,14 +236,14 @@ async def _load_products(page: Page, min_items: int) -> List[Locator]:
     return cards
 
 
-async def _click_load_more(page: Page) -> None:
+async def _click_load_more(page: Page) -> bool:
     targeted = page.locator("text=/더보기|더 보기|상품 더보기/")
     if await targeted.count() > 0:
         try:
             await targeted.first.click()
             await page.wait_for_timeout(1500)
             LOGGER.debug("Clicked explicit load more control")
-            return
+            return True
         except Exception as exc:
             LOGGER.debug("Failed to click explicit load more control: %s", exc)
 
@@ -248,10 +262,13 @@ async def _click_load_more(page: Page) -> None:
                 await button.click()
                 await page.wait_for_timeout(1500)
                 LOGGER.debug("Clicked load more button")
-                return
+                return True
             except Exception as exc:
                 LOGGER.debug("Failed to click load more: %s", exc)
                 continue
+
+    LOGGER.debug("No load more controls were activated in this pass")
+    return False
 
 
 async def collect_products(url: str, min_items: int = 1000, headless: bool = True) -> List[Product]:
@@ -261,22 +278,52 @@ async def collect_products(url: str, min_items: int = 1000, headless: bool = Tru
         page.set_default_timeout(30_000)
         try:
             LOGGER.info("Navigating to %s", url)
-            await page.goto(url, wait_until="networkidle")
+            try:
+                response = await page.goto(url, wait_until="networkidle")
+            except Exception as exc:
+                LOGGER.exception("Navigation to %s failed: %s", url, exc)
+                raise
+            if response is not None:
+                LOGGER.info(
+                    "Initial navigation complete with status=%s and final_url=%s",
+                    response.status,
+                    response.url,
+                )
+            else:
+                LOGGER.warning("page.goto returned no response object; content may be cached")
             await page.wait_for_timeout(2000)
             LOGGER.info("Page navigation complete; beginning product discovery (min_items=%d)", min_items)
             cards = await _load_products(page, min_items)
             products: List[Product] = []
             seen_codes = set()
+            skipped_duplicates = 0
             for card in cards:
                 product = await _extract_card_data(card)
                 if product.product_code and product.product_code in seen_codes:
                     LOGGER.debug("Skipping duplicate product_code %s", product.product_code)
+                    skipped_duplicates += 1
                     continue
                 if product.product_code:
                     seen_codes.add(product.product_code)
+                if not product.name:
+                    LOGGER.debug("Card produced product with empty name and code %s", product.product_code)
                 products.append(product)
             if len(products) > min_items:
                 products = products[:min_items]
+            if not products:
+                LOGGER.warning("No products extracted from %d candidate cards", len(cards))
+            else:
+                sample_names = ", ".join(
+                    filter(None, (product.name for product in products[:3]))
+                )
+                if sample_names:
+                    LOGGER.info("Sample product names: %s", sample_names)
+            LOGGER.info(
+                "Extraction summary: products=%d unique_codes=%d duplicates_skipped=%d",
+                len(products),
+                len(seen_codes),
+                skipped_duplicates,
+            )
             return products
         finally:
             await browser.close()
