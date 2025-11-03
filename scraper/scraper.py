@@ -129,22 +129,26 @@ async def _extract_image(card: Locator) -> Optional[str]:
     return None
 
 
+CARD_SELECTORS = [
+    "[data-info]",
+    "li[data-info]",
+    "div[data-info]",
+    "li.prod-item",
+    "li[class*='prd']",
+    "div.product-item",
+    "li",
+]
+
+
 async def _get_product_cards(page: Page) -> List[Locator]:
     """Return locators for product cards discovered on the page."""
 
-    card_selectors = [
-        "[data-info]",
-        "li[data-info]",
-        "div[data-info]",
-        "li.prod-item",
-        "li[class*='prd']",
-        "div.product-item",
-        "li",
-    ]
-    for selector in card_selectors:
+    LOGGER.debug("Scanning for product cards using selectors: %s", ", ".join(CARD_SELECTORS))
+    for selector in CARD_SELECTORS:
         cards = page.locator(selector)
         count = await cards.count()
         if count == 0:
+            LOGGER.debug("Selector %s located no elements", selector)
             continue
         LOGGER.debug("Located %d cards with selector %s", count, selector)
         filtered: List[Locator] = []
@@ -157,7 +161,14 @@ async def _get_product_cards(page: Page) -> List[Locator]:
             if data_info or selector == "li" or selector == "div.product-item":
                 filtered.append(card)
         if filtered:
+            LOGGER.info(
+                "Selector %s yielded %d filtered product cards (raw count: %d)",
+                selector,
+                len(filtered),
+                count,
+            )
             return filtered
+    LOGGER.info("No candidate selectors matched; returning empty product list")
     return []
 
 
@@ -165,21 +176,36 @@ async def _load_products(page: Page, min_items: int) -> List[Locator]:
     seen = 0
     attempts_without_growth = 0
     max_attempts = 40
+    attempt = 0
     try:
-        await page.wait_for_selector("[data-info]", timeout=30_000)
+        LOGGER.info("Waiting for initial product cards with selector %s", CARD_SELECTORS[0])
+        await page.wait_for_selector(CARD_SELECTORS[0], timeout=30_000)
     except Exception:
         LOGGER.warning("Timed out waiting for initial product cards")
+        try:
+            title = await page.title()
+        except Exception:
+            title = "<unknown>"
+        LOGGER.info("Page title at timeout: %s", title)
     while True:
+        attempt += 1
         cards = await _get_product_cards(page)
+        LOGGER.info("Attempt %d: located %d product candidates", attempt, len(cards))
         if len(cards) >= min_items:
             return cards
         if len(cards) == seen:
             attempts_without_growth += 1
         else:
             attempts_without_growth = 0
+        LOGGER.debug(
+            "Attempts without growth: %d (previously seen: %d)",
+            attempts_without_growth,
+            seen,
+        )
         seen = len(cards)
         if attempts_without_growth > max_attempts:
             LOGGER.warning("No additional cards loaded after %d attempts", attempts_without_growth)
+            LOGGER.info("Final card count before aborting: %d", len(cards))
             return cards
         LOGGER.debug("Loaded %d cards; scrolling for more", len(cards))
         await page.mouse.wheel(0, 5000)
@@ -209,12 +235,14 @@ async def _click_load_more(page: Page) -> None:
 
     buttons = page.locator("button, a")
     count = await buttons.count()
+    LOGGER.debug("Scanning %d generic buttons/links for load more text", count)
     for idx in range(count):
         button = buttons.nth(idx)
         try:
             text = (await button.inner_text()).strip()
         except Exception:
             continue
+        LOGGER.debug("Button %d text snippet: %s", idx, text[:40])
         if any(keyword in text for keyword in ("더보기", "더 보기", "상품 더보기", "전체보기")):
             try:
                 await button.click()
@@ -235,12 +263,14 @@ async def collect_products(url: str, min_items: int = 1000, headless: bool = Tru
             LOGGER.info("Navigating to %s", url)
             await page.goto(url, wait_until="networkidle")
             await page.wait_for_timeout(2000)
+            LOGGER.info("Page navigation complete; beginning product discovery (min_items=%d)", min_items)
             cards = await _load_products(page, min_items)
             products: List[Product] = []
             seen_codes = set()
             for card in cards:
                 product = await _extract_card_data(card)
                 if product.product_code and product.product_code in seen_codes:
+                    LOGGER.debug("Skipping duplicate product_code %s", product.product_code)
                     continue
                 if product.product_code:
                     seen_codes.add(product.product_code)
