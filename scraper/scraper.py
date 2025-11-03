@@ -130,7 +130,12 @@ async def _extract_image(card: Locator) -> Optional[str]:
 
 
 async def _get_product_cards(page: Page) -> List[Locator]:
+    """Return locators for product cards discovered on the page."""
+
     card_selectors = [
+        "[data-info]",
+        "li[data-info]",
+        "div[data-info]",
         "li.prod-item",
         "li[class*='prd']",
         "div.product-item",
@@ -139,16 +144,31 @@ async def _get_product_cards(page: Page) -> List[Locator]:
     for selector in card_selectors:
         cards = page.locator(selector)
         count = await cards.count()
-        if count >= 1:
-            LOGGER.debug("Located %d cards with selector %s", count, selector)
-            return [cards.nth(i) for i in range(count)]
+        if count == 0:
+            continue
+        LOGGER.debug("Located %d cards with selector %s", count, selector)
+        filtered: List[Locator] = []
+        for idx in range(count):
+            card = cards.nth(idx)
+            try:
+                data_info = await card.get_attribute("data-info")
+            except Exception:
+                data_info = None
+            if data_info or selector == "li" or selector == "div.product-item":
+                filtered.append(card)
+        if filtered:
+            return filtered
     return []
 
 
 async def _load_products(page: Page, min_items: int) -> List[Locator]:
     seen = 0
     attempts_without_growth = 0
-    max_attempts = 20
+    max_attempts = 40
+    try:
+        await page.wait_for_selector("[data-info]", timeout=30_000)
+    except Exception:
+        LOGGER.warning("Timed out waiting for initial product cards")
     while True:
         cards = await _get_product_cards(page)
         if len(cards) >= min_items:
@@ -164,11 +184,29 @@ async def _load_products(page: Page, min_items: int) -> List[Locator]:
         LOGGER.debug("Loaded %d cards; scrolling for more", len(cards))
         await page.mouse.wheel(0, 5000)
         await page.wait_for_timeout(1500)
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            LOGGER.debug("Failed to scroll via window.scrollTo")
         await _click_load_more(page)
+        try:
+            await page.wait_for_load_state("networkidle")
+        except Exception:
+            LOGGER.debug("Timed out waiting for network idle after scrolling")
     return cards
 
 
 async def _click_load_more(page: Page) -> None:
+    targeted = page.locator("text=/더보기|더 보기|상품 더보기/")
+    if await targeted.count() > 0:
+        try:
+            await targeted.first.click()
+            await page.wait_for_timeout(1500)
+            LOGGER.debug("Clicked explicit load more control")
+            return
+        except Exception as exc:
+            LOGGER.debug("Failed to click explicit load more control: %s", exc)
+
     buttons = page.locator("button, a")
     count = await buttons.count()
     for idx in range(count):
@@ -177,7 +215,7 @@ async def _click_load_more(page: Page) -> None:
             text = (await button.inner_text()).strip()
         except Exception:
             continue
-        if "더보기" in text or "보기" in text:
+        if any(keyword in text for keyword in ("더보기", "더 보기", "상품 더보기", "전체보기")):
             try:
                 await button.click()
                 await page.wait_for_timeout(1500)
