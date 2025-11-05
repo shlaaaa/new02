@@ -6,6 +6,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -23,6 +24,17 @@ IMAGE_SELECTOR = "div.prd-img img"
 TOTAL_COUNT_SELECTOR = "#totalCnt"
 ENTRY_DATA_SELECTOR = "#entry-data"
 PAGINATION_LINK_SELECTOR = "nav.paging a[data-index=\"{index}\"]"
+
+DEBUG_ARTIFACT_DIR = Path("debug")
+PREFERRED_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/127.0.0.0 Safari/537.36"
+)
+DEFAULT_HEADERS = {
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.gsshop.com/",
+}
 
 
 @dataclass
@@ -167,10 +179,41 @@ async def _navigate_to_page(page: Page, index: int) -> None:
     await page.wait_for_selector(CARD_SELECTOR, state="visible")
 
 
+async def _capture_failure_artifacts(page: Page) -> None:
+    """Persist HTML and screenshots when navigation fails."""
+
+    try:
+        DEBUG_ARTIFACT_DIR.mkdir(exist_ok=True)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        LOGGER.debug("Unable to create debug directory: %s", exc)
+        return
+
+    try:
+        html_path = DEBUG_ARTIFACT_DIR / "response.html"
+        html_path.write_text(await page.content(), encoding="utf-8")
+        LOGGER.info("Wrote debug HTML to %s", html_path)
+    except Exception as exc:  # pragma: no cover - debug utility
+        LOGGER.debug("Failed to write debug HTML: %s", exc)
+
+    try:
+        screenshot_path = DEBUG_ARTIFACT_DIR / "response.png"
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+        LOGGER.info("Wrote debug screenshot to %s", screenshot_path)
+    except Exception as exc:  # pragma: no cover - debug utility
+        LOGGER.debug("Failed to capture screenshot: %s", exc)
+
+
 async def collect_products(url: str, min_items: int = 1000, headless: bool = True) -> List[Product]:
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless)
-        page = await browser.new_page()
+        browser_args = ["--disable-blink-features=AutomationControlled"]
+        browser = await playwright.chromium.launch(headless=headless, args=browser_args)
+        context = await browser.new_context(
+            user_agent=PREFERRED_USER_AGENT,
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            extra_http_headers=DEFAULT_HEADERS,
+        )
+        page = await context.new_page()
         page.set_default_timeout(30_000)
         try:
             LOGGER.info("Navigating to %s", url)
@@ -180,13 +223,27 @@ async def collect_products(url: str, min_items: int = 1000, headless: bool = Tru
                 LOGGER.exception("Navigation to %s failed: %s", url, exc)
                 raise
             if response is not None:
+                allow_header = response.headers.get("allow")
                 LOGGER.info(
-                    "Initial navigation complete with status=%s and final_url=%s",
+                    "Initial navigation complete with status=%s final_url=%s allow=%s",
                     response.status,
                     response.url,
+                    allow_header,
                 )
+                if response.status >= 400:
+                    user_agent = await page.evaluate("navigator.userAgent")
+                    LOGGER.error(
+                        "Initial navigation failed with HTTP %s (allow=%s, ua=%s)",
+                        response.status,
+                        allow_header,
+                        user_agent,
+                    )
+                    await _capture_failure_artifacts(page)
+                    raise RuntimeError(f"Initial navigation failed with HTTP {response.status}")
             else:
                 LOGGER.warning("page.goto returned no response object; content may be cached")
+            user_agent = await page.evaluate("navigator.userAgent")
+            LOGGER.debug("Navigator userAgent reported as %s", user_agent)
             await page.wait_for_selector(CARD_SELECTOR, timeout=30_000)
             await page.wait_for_load_state("networkidle")
             LOGGER.info("Page navigation complete; beginning product discovery (min_items=%d)", min_items)
@@ -253,6 +310,7 @@ async def collect_products(url: str, min_items: int = 1000, headless: bool = Tru
             )
             return products
         finally:
+            await context.close()
             await browser.close()
 
 
